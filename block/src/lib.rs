@@ -39,6 +39,7 @@ pub use sparse::{BLKDISCARD, BLKZEROOUT};
 pub mod vhd;
 pub mod vhdx;
 pub mod vhdx_sync;
+pub mod vmdk_sync;
 
 use std::alloc::{Layout, alloc_zeroed};
 use std::collections::VecDeque;
@@ -563,6 +564,7 @@ pub enum ImageType {
     Qcow2,
     Raw,
     Vhdx,
+    Vmdk,
     #[default]
     Unknown,
 }
@@ -574,6 +576,7 @@ impl fmt::Display for ImageType {
             ImageType::Qcow2 => write!(f, "qcow2"),
             ImageType::Raw => write!(f, "raw"),
             ImageType::Vhdx => write!(f, "vhdx"),
+            ImageType::Vmdk => write!(f, "vmdk"),
             ImageType::Unknown => write!(f, "unknown"),
         }
     }
@@ -592,6 +595,7 @@ impl FromStr for ImageType {
             "qcow2" => Ok(ImageType::Qcow2),
             "raw" => Ok(ImageType::Raw),
             "vhdx" => Ok(ImageType::Vhdx),
+            "vmdk" => Ok(ImageType::Vmdk),
             _ => Err(ImageTypeParseError::InvalidValue(s.to_string())),
         }
     }
@@ -641,6 +645,10 @@ pub fn detect_image_type(f: &mut File) -> BlockResult<ImageType> {
         ImageType::FixedVhd
     } else if u64::from_le_bytes(block[0..8].try_into().unwrap()) == VHDX_SIGN {
         ImageType::Vhdx
+    } else if vmdk_sync::probe_vmdk(f)
+        .map_err(|e| BlockError::new(BlockErrorKind::Io, e).with_op(ErrorOp::DetectImageType))?
+    {
+        ImageType::Vmdk
     } else {
         ImageType::Raw
     };

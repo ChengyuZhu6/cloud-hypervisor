@@ -24,6 +24,7 @@ use crate::fixed_vhd_disk::FixedVhdDisk;
 use crate::qcow_disk::QcowDisk;
 use crate::raw_disk::{RawBackend, RawDisk};
 use crate::vhdx_sync::VhdxDiskSync;
+use crate::vmdk_sync::VmdkDiskSync;
 use crate::{
     ImageType, block_aio_is_supported, detect_image_type, open_disk_image, preallocate_disk,
 };
@@ -83,21 +84,29 @@ fn aio_supported() -> bool {
 /// callers can perform post construction validation (e.g. type mismatch
 /// checks, configuration warnings).
 pub fn open_disk(options: &DiskOpenOptions<'_>) -> BlockResult<OpenedDisk> {
-    let mut fs_options = fs::OpenOptions::new();
-    fs_options.read(true);
-    fs_options.write(!options.readonly);
-    if options.direct {
-        fs_options.custom_flags(libc::O_DIRECT);
+    let mut detect_options = fs::OpenOptions::new();
+    detect_options.read(true);
+    detect_options.write(!options.readonly);
+
+    let mut detect_file = open_disk_image(options.path, &detect_options)?;
+    let image_type = detect_image_type(&mut detect_file)?;
+    drop(detect_file);
+
+    let mut io_options = fs::OpenOptions::new();
+    io_options.read(true);
+    io_options.write(!options.readonly);
+    if options.direct && image_type != ImageType::Vmdk {
+        io_options.custom_flags(libc::O_DIRECT);
     }
 
-    let mut file = open_disk_image(options.path, &fs_options)?;
-    let image_type = detect_image_type(&mut file)?;
+    let file = open_disk_image(options.path, &io_options)?;
 
     let disk: Box<dyn AsyncFullDiskFile> = match image_type {
         ImageType::FixedVhd => open_fixed_vhd(file, options)?,
         ImageType::Raw => open_raw(file, options)?,
         ImageType::Qcow2 => open_qcow2(file, options)?,
         ImageType::Vhdx => open_vhdx(file, options)?,
+        ImageType::Vmdk => open_vmdk(file, options)?,
         ImageType::Unknown => {
             return Err(
                 BlockError::from_kind(BlockErrorKind::UnsupportedFeature).with_path(options.path)
@@ -115,6 +124,17 @@ fn open_vhdx(
     info!("Opening VHDX disk file with synchronous backend");
     Ok(Box::new(
         VhdxDiskSync::new(file).map_err(|e| e.with_path(options.path))?,
+    ))
+}
+
+fn open_vmdk(
+    file: fs::File,
+    options: &DiskOpenOptions<'_>,
+) -> BlockResult<Box<dyn AsyncFullDiskFile>> {
+    info!("Opening VMDK disk file with synchronous backend");
+    Ok(Box::new(
+        VmdkDiskSync::new(file, options.path, options.readonly, options.direct)
+            .map_err(|e| e.with_path(options.path))?,
     ))
 }
 
@@ -205,9 +225,11 @@ fn open_qcow2(
 
 #[cfg(test)]
 mod unit_tests {
+    use std::fs::OpenOptions;
     use std::io::Write;
     use std::path::Path;
 
+    use vmm_sys_util::tempdir::TempDir;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
@@ -257,6 +279,83 @@ mod unit_tests {
         let options = default_options(&path);
         let opened = open_disk(&options).unwrap();
         assert_eq!(opened.image_type, ImageType::Qcow2);
+    }
+
+    #[test]
+    fn detect_vmdk_image() {
+        let dir = TempDir::new_with_prefix("/tmp/ch").unwrap();
+        let descriptor_path = dir.as_path().join("disk.vmdk");
+        let extent_path = dir.as_path().join("disk-flat.vmdk");
+
+        {
+            let mut descriptor = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&descriptor_path)
+                .unwrap();
+            writeln!(
+                descriptor,
+                r#"# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType="monolithicFlat"
+RW 8 FLAT "disk-flat.vmdk" 0"#
+            )
+            .unwrap();
+        }
+
+        let extent = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&extent_path)
+            .unwrap();
+        extent.set_len(8 * 512).unwrap();
+
+        let options = default_options(&descriptor_path);
+        let opened = open_disk(&options).unwrap();
+        assert_eq!(opened.image_type, ImageType::Vmdk);
+    }
+
+    #[test]
+    fn detect_vmdk_image_with_direct() {
+        let dir = TempDir::new_with_prefix("/tmp/ch").unwrap();
+        let descriptor_path = dir.as_path().join("disk.vmdk");
+        let extent_path = dir.as_path().join("disk-flat.vmdk");
+
+        {
+            let mut descriptor = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&descriptor_path)
+                .unwrap();
+            writeln!(
+                descriptor,
+                r#"# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType="monolithicFlat"
+RW 8 FLAT "disk-flat.vmdk" 0"#
+            )
+            .unwrap();
+        }
+
+        let extent = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&extent_path)
+            .unwrap();
+        extent.set_len(8 * 512).unwrap();
+
+        let mut options = default_options(&descriptor_path);
+        options.direct = true;
+        let opened = open_disk(&options).unwrap();
+        assert_eq!(opened.image_type, ImageType::Vmdk);
     }
 
     #[test]

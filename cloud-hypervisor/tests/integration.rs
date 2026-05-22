@@ -1894,6 +1894,95 @@ mod common_parallel {
     }
 
     #[test]
+    fn test_virtio_block_vmdk_data_disk() {
+        const VMDK_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+        const VMDK_SECTORS: u64 = VMDK_SIZE_BYTES / 512;
+
+        let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
+        let kernel_path = direct_kernel_boot_path();
+        let vmdk_desc_path = guest.tmp_dir.as_path().join("data.vmdk");
+        let vmdk_flat_path = guest.tmp_dir.as_path().join("data-flat.vmdk");
+
+        {
+            let mut descriptor = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&vmdk_desc_path)
+                .unwrap();
+            writeln!(
+                descriptor,
+                r#"# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType="monolithicFlat"
+RW {VMDK_SECTORS} FLAT "data-flat.vmdk" 0"#
+            )
+            .unwrap();
+        }
+        File::create(&vmdk_flat_path)
+            .unwrap()
+            .set_len(VMDK_SIZE_BYTES)
+            .unwrap();
+
+        let mut child = GuestCommand::new(&guest)
+            .default_cpus()
+            .default_memory()
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args([
+                "--disk",
+                format!(
+                    "path={},image_type=raw",
+                    guest.disk_config.disk(DiskType::OperatingSystem).unwrap()
+                )
+                .as_str(),
+                format!(
+                    "path={},image_type=raw",
+                    guest.disk_config.disk(DiskType::CloudInit).unwrap()
+                )
+                .as_str(),
+                format!("path={},image_type=vmdk", vmdk_desc_path.to_str().unwrap()).as_str(),
+            ])
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+
+            assert_eq!(
+                guest
+                    .ssh_command("lsblk | grep vdc | grep -c 16M")
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                1
+            );
+
+            guest
+                .ssh_command(
+                    "head -c 1048576 /dev/urandom > /tmp/vmdk-src && \
+                     sha256sum /tmp/vmdk-src | awk '{print $1}' > /tmp/vmdk-src.sha && \
+                     sudo dd if=/tmp/vmdk-src of=/dev/vdc bs=1M count=1 conv=fsync status=none && \
+                     sudo dd if=/dev/vdc of=/tmp/vmdk-dst bs=1M count=1 status=none && \
+                     sha256sum /tmp/vmdk-dst | awk '{print $1}' > /tmp/vmdk-dst.sha && \
+                     diff -u /tmp/vmdk-src.sha /tmp/vmdk-dst.sha",
+                )
+                .unwrap();
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+
+        disk_check_consistency(&vmdk_desc_path, None);
+    }
+
+    #[test]
     fn test_virtio_block_dynamic_vhdx_expand() {
         let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
         _test_virtio_block_dynamic_vhdx_expand(&guest);
